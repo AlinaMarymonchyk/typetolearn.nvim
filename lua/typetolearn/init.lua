@@ -10,6 +10,16 @@ M.active_session = nil
 M.config = {}
 M._hooked = false
 
+-- Debug log to file (temporary — remove after debugging)
+local _log_file = "/tmp/typetolearn_debug.log"
+local function _dbg(msg)
+  local f = io.open(_log_file, "a")
+  if f then
+    f:write(os.date("%H:%M:%S") .. " " .. msg .. "\n")
+    f:close()
+  end
+end
+
 local defaults = {
   ghost_hl = "Comment",
   error_hl = "DiagnosticError",
@@ -19,35 +29,34 @@ local defaults = {
 -- Diff: use vim.diff for reliable hunk computation
 -- ============================================================================
 
---- Compute hunks using neovim's built-in vim.diff (Myers algorithm).
---- Returns list of {start_line (0-indexed in old), count_old, count_new, new_lines}.
 function M._compute_hunks(old_lines, new_lines)
+  if #old_lines == 0 then
+    return { { old_start = 0, old_count = 0, new_start = 0, new_lines = new_lines } }
+  end
+
   local old_text = table.concat(old_lines, "\n") .. "\n"
   local new_text = table.concat(new_lines, "\n") .. "\n"
-
-  -- vim.diff with result_type="indices" returns list of {start_a, count_a, start_b, count_b}
   local indices = vim.diff(old_text, new_text, { result_type = "indices" })
 
   local hunks = {}
   for _, idx in ipairs(indices) do
     local start_a, count_a, start_b, count_b = idx[1], idx[2], idx[3], idx[4]
-    -- Extract the new lines for this hunk
     local hunk_new_lines = {}
     for i = start_b, start_b + count_b - 1 do
       table.insert(hunk_new_lines, new_lines[i])
     end
     table.insert(hunks, {
-      old_start = start_a - 1, -- convert to 0-indexed
+      old_start = start_a - 1,
       old_count = count_a,
+      new_start = start_b - 1,
       new_lines = hunk_new_lines,
     })
   end
-
   return hunks
 end
 
 -- ============================================================================
--- Ghost text rendering
+-- Ghost text rendering (on blank lines — buffer has "" where user types)
 -- ============================================================================
 
 function M._render_ghost(session)
@@ -59,7 +68,7 @@ function M._render_ghost(session)
     local is_done = (i - 1 < session.current_line)
 
     if is_done then
-      -- already typed
+      -- already typed into buffer
     elseif is_current then
       local remaining = line:sub(session.current_col + 1)
       if #remaining > 0 then
@@ -82,7 +91,7 @@ function M._render_ghost(session)
 end
 
 -- ============================================================================
--- Typing session
+-- Typing session (blank-out approach: lines are blanked, user types to fill)
 -- ============================================================================
 
 function M.start_session(bufnr, start_line, lines, opts)
@@ -122,18 +131,20 @@ function M.start_session(bufnr, start_line, lines, opts)
 
   api.nvim_set_option_value("modifiable", true, { buf = bufnr })
 
-  -- Insert blank lines where the new content should go
-  local blank_lines = {}
-  for _ = 1, #lines do
-    table.insert(blank_lines, "")
+  -- Blank lines if not already blanked by caller
+  if not opts.lines_already_blank then
+    local blank_lines = {}
+    for _ = 1, #lines do
+      table.insert(blank_lines, "")
+    end
+    api.nvim_buf_set_lines(bufnr, start_line, start_line, false, blank_lines)
   end
-  api.nvim_buf_set_lines(bufnr, start_line, start_line, false, blank_lines)
 
   M._render_ghost(session)
   api.nvim_win_set_cursor(0, { start_line + 1, 0 })
   vim.cmd("startinsert")
   M._attach_keys(session)
-  M._echo("Type the ghost text. [Esc] to skip remaining.", "MoreMsg")
+  M._echo("Type the ghost text. [Esc] to skip.", "MoreMsg")
 end
 
 -- ============================================================================
@@ -142,6 +153,20 @@ end
 
 function M._attach_keys(session)
   local group = api.nvim_create_augroup("TypeToLearn", { clear = true })
+
+  api.nvim_create_autocmd("BufEnter", {
+    group = group,
+    buffer = session.bufnr,
+    callback = function()
+      if M.active_session and M.active_session.bufnr == session.bufnr then
+        local buf_line = session.start_line + session.current_line
+        pcall(api.nvim_win_set_cursor, 0, { buf_line + 1, session.current_col })
+        vim.schedule(function()
+          if M.active_session then vim.cmd("startinsert") end
+        end)
+      end
+    end,
+  })
 
   api.nvim_create_autocmd("InsertCharPre", {
     group = group,
@@ -254,6 +279,7 @@ end
 function M._complete_session()
   local s = M.active_session
   if not s then return end
+  _dbg("COMPLETE_SESSION: bufnr=" .. s.bufnr .. " line=" .. s.current_line .. "/" .. #s.lines)
   M._cleanup(s)
   local accuracy = s.typed_chars > 0 and math.floor((s.typed_chars / (s.typed_chars + s.errors)) * 100) or 0
   M._echo(string.format("Done! %d chars, %d errors, %d%% accuracy", s.typed_chars, s.errors, accuracy), "MoreMsg")
@@ -264,6 +290,7 @@ end
 function M.skip_session()
   local s = M.active_session
   if not s then return end
+  -- Fill in remaining content
   for i = s.current_line, #s.lines - 1 do
     local buf_line = s.start_line + i
     api.nvim_buf_set_lines(s.bufnr, buf_line, buf_line + 1, false, { s.lines[i + 1] })
@@ -277,9 +304,33 @@ end
 function M.cancel_session()
   local s = M.active_session
   if not s then return end
-  api.nvim_buf_set_lines(s.bufnr, s.start_line, s.start_line + #s.lines, false, {})
+  -- Fill in content (don't revert — disk already has new content)
+  for i = s.current_line, #s.lines - 1 do
+    local buf_line = s.start_line + i
+    api.nvim_buf_set_lines(s.bufnr, buf_line, buf_line + 1, false, { s.lines[i + 1] })
+  end
   M._cleanup(s)
-  M._echo("Cancelled — reverted.", "WarningMsg")
+  M._echo("Cancelled — changes applied.", "WarningMsg")
+  M.active_session = nil
+end
+
+-- Force-finish the session: fill in remaining text, write, clear modified.
+-- Used when a new diff comes in during an active typing session.
+function M._force_finish_session()
+  local s = M.active_session
+  if not s then return end
+  _dbg("FORCE_FINISH: filling in remaining text")
+  -- Fill in all remaining lines
+  for i = s.current_line, #s.lines - 1 do
+    local buf_line = s.start_line + i
+    pcall(api.nvim_buf_set_lines, s.bufnr, buf_line, buf_line + 1, false, { s.lines[i + 1] })
+  end
+  M._cleanup(s)
+  -- Write to disk (noautocmd to avoid save hooks trimming lines)
+  pcall(api.nvim_buf_call, s.bufnr, function()
+    vim.cmd("silent! noautocmd write!")
+    vim.cmd("filetype detect")
+  end)
   M.active_session = nil
 end
 
@@ -313,19 +364,6 @@ function M._echo(msg, hl)
 end
 
 -- ============================================================================
--- Reload buffer from disk (recovery helper)
--- ============================================================================
-
-function M._reload_from_disk(file_path)
-  local bufnr = vim.fn.bufnr(file_path)
-  if bufnr ~= -1 and api.nvim_buf_is_loaded(bufnr) then
-    api.nvim_buf_call(bufnr, function()
-      vim.cmd("edit!")
-    end)
-  end
-end
-
--- ============================================================================
 -- Hook into claudecode.nvim
 -- ============================================================================
 
@@ -333,15 +371,9 @@ function M._hook_claudecode()
   if M._hooked then return end
 
   local ok, claude_diff = pcall(require, "claudecode.diff")
-  if not ok then
-    M._echo("claudecode.diff not found, using file watcher fallback", "WarningMsg")
-    M._start_file_watching()
-    return
-  end
+  if not ok then return end
 
-  if not claude_diff._register_diff_state or not claude_diff.close_diff_by_tab_name then
-    M._echo("claudecode.diff API changed, using fallback", "WarningMsg")
-    M._start_file_watching()
+  if not claude_diff.open_diff_blocking or not claude_diff.close_diff_by_tab_name then
     return
   end
 
@@ -350,17 +382,25 @@ function M._hook_claudecode()
 
   M._diff_data = {}
 
-  -- Capture diff data when claudecode registers a diff
-  local original_register = claude_diff._register_diff_state
-  claude_diff._register_diff_state = function(tab_name, diff_data)
-    -- Read old file content from buffer (more reliable than io.open)
-    local old_lines = {}
-    if diff_data.old_file_path then
-      local bufnr = vim.fn.bufnr(diff_data.old_file_path)
-      if bufnr ~= -1 and api.nvim_buf_is_loaded(bufnr) then
-        old_lines = api.nvim_buf_get_lines(bufnr, 0, -1, false)
-      else
-        local f = io.open(diff_data.old_file_path, "r")
+  -- Patch open_diff_blocking: capture data AND force-finish any active session
+  -- so the buffer is clean for claudecode's dirty-buffer check.
+  local original_open = claude_diff.open_diff_blocking
+  claude_diff.open_diff_blocking = function(old_file_path, new_file_path, new_file_contents, tab_name)
+    _dbg("OPEN_DIFF: tab=" .. tostring(tab_name) .. " path=" .. tostring(old_file_path))
+
+    -- KEY FIX: If we have an active typing session, finish it NOW
+    -- (fills in remaining text, writes to disk, clears modified flag).
+    -- This prevents the "Cannot create diff: file has unsaved changes" error.
+    if M.active_session then
+      _dbg("OPEN_DIFF: force-finishing active session before new diff")
+      pcall(M._force_finish_session)
+    end
+
+    -- Capture diff data (read old from disk AFTER finishing session, so it's current)
+    pcall(function()
+      local old_lines = {}
+      if old_file_path then
+        local f = io.open(old_file_path, "r")
         if f then
           local content = f:read("*a")
           f:close()
@@ -370,128 +410,185 @@ function M._hook_claudecode()
           end
         end
       end
-    end
 
-    -- Parse new content
-    local new_lines = {}
-    if diff_data.new_file_contents then
-      new_lines = vim.split(diff_data.new_file_contents, "\n")
-      if #new_lines > 0 and new_lines[#new_lines] == "" then
-        table.remove(new_lines)
+      local new_lines = {}
+      if new_file_contents then
+        new_lines = vim.split(new_file_contents, "\n")
+        if #new_lines > 0 and new_lines[#new_lines] == "" then
+          table.remove(new_lines)
+        end
       end
-    end
 
-    M._diff_data[tab_name] = {
-      old_file_path = diff_data.old_file_path,
-      old_lines = old_lines,
-      new_lines = new_lines,
-    }
-    return original_register(tab_name, diff_data)
+      M._diff_data[tab_name] = {
+        old_file_path = old_file_path,
+        old_lines = old_lines,
+        new_lines = new_lines,
+      }
+      _dbg("OPEN_DIFF_CAPTURED: old=" .. #old_lines .. " new=" .. #new_lines)
+    end)
+
+    return original_open(old_file_path, new_file_path, new_file_contents, tab_name)
   end
 
-  -- Patch close_diff_by_tab_name — called when CLI accepts via "Yes"
+  -- Patch close_diff_by_tab_name
   local original_close = claude_diff.close_diff_by_tab_name
   claude_diff.close_diff_by_tab_name = function(tab_name)
-    local captured = M._diff_data[tab_name]
-    M._diff_data[tab_name] = nil
+    _dbg("CLOSE: tab=" .. tostring(tab_name) .. " has_data=" .. tostring(M._diff_data[tab_name] ~= nil))
+    local captured = nil
+    pcall(function()
+      captured = M._diff_data[tab_name]
+      M._diff_data[tab_name] = nil
+    end)
 
     local result = original_close(tab_name)
 
+    _dbg("CLOSE_AFTER: captured=" .. tostring(captured ~= nil)
+      .. " accepted_in_nvim=" .. tostring(captured and captured._accepted_in_nvim))
+
     if captured and captured.old_file_path and not captured._accepted_in_nvim then
       vim.defer_fn(function()
-        -- Check if file on disk actually changed (accept vs reject)
-        local f = io.open(captured.old_file_path, "r")
-        if not f then
-          -- New file that was accepted
-          if #captured.new_lines > 0 then
-            M._intercept_change(captured.old_file_path, captured.old_lines, captured.new_lines)
+        pcall(function()
+          -- Check if disk actually changed (accept vs reject)
+          local f = io.open(captured.old_file_path, "r")
+          if not f then
+            if #captured.new_lines > 0 then
+              M._intercept_change(captured.old_file_path, captured.old_lines, captured.new_lines)
+            end
+            return
           end
-          return
-        end
-        local disk_content = f:read("*a")
-        f:close()
-        local disk_lines = vim.split(disk_content, "\n")
-        if #disk_lines > 0 and disk_lines[#disk_lines] == "" then
-          table.remove(disk_lines)
-        end
+          local disk_content = f:read("*a")
+          f:close()
+          local disk_lines = vim.split(disk_content, "\n")
+          if #disk_lines > 0 and disk_lines[#disk_lines] == "" then
+            table.remove(disk_lines)
+          end
 
-        -- Compare disk to old content
-        local changed = #disk_lines ~= #captured.old_lines
-        if not changed then
-          for idx = 1, #disk_lines do
-            if disk_lines[idx] ~= captured.old_lines[idx] then
-              changed = true
-              break
+          local changed = #disk_lines ~= #captured.old_lines
+          if not changed then
+            for idx = 1, #disk_lines do
+              if disk_lines[idx] ~= captured.old_lines[idx] then
+                changed = true
+                break
+              end
             end
           end
-        end
 
-        if changed then
-          M._intercept_change(captured.old_file_path, captured.old_lines, captured.new_lines)
-        end
+          _dbg("CLOSE_DISK_CHECK: disk_lines=" .. #disk_lines .. " old_lines=" .. #captured.old_lines .. " changed=" .. tostring(changed))
+          if changed then
+            M._intercept_change(captured.old_file_path, captured.old_lines, captured.new_lines)
+          else
+            -- Disk unchanged = diff setup failed (CLI didn't write).
+            -- Don't write to disk (would cause "unexpectedly modified" error).
+            -- Instead, intercept and set buffer content directly in _intercept_change.
+            _dbg("CLOSE_FALLBACK: intercepting without disk write")
+            M._intercept_change(captured.old_file_path, captured.old_lines, captured.new_lines)
+          end
+        end)
       end, 300)
     end
 
     return result
   end
 
-  -- Patch _resolve_diff_as_saved — called when user accepts via :w in nvim
+  -- Patch _resolve_diff_as_saved
   local original_resolve = claude_diff._resolve_diff_as_saved
   claude_diff._resolve_diff_as_saved = function(tab_name, buffer_id)
-    local captured = M._diff_data[tab_name]
-    if captured then
-      captured._accepted_in_nvim = true
-    end
+    _dbg("RESOLVE_SAVED: tab=" .. tostring(tab_name) .. " has_data=" .. tostring(M._diff_data[tab_name] ~= nil))
+    local captured = nil
+    pcall(function()
+      captured = M._diff_data[tab_name]
+      if captured then captured._accepted_in_nvim = true end
+    end)
 
     original_resolve(tab_name, buffer_id)
 
     if captured then
-      M._diff_data[tab_name] = nil
+      pcall(function() M._diff_data[tab_name] = nil end)
       vim.defer_fn(function()
-        M._intercept_change(captured.old_file_path, captured.old_lines, captured.new_lines)
+        pcall(function()
+          M._intercept_change(captured.old_file_path, captured.old_lines, captured.new_lines)
+        end)
       end, 800)
     end
   end
 end
 
 -- ============================================================================
--- Intercept a change: revert buffer, show ghost text for typing
+-- Intercept a change: blank changed lines, show ghost text for typing
 -- ============================================================================
 
 function M._intercept_change(file_path, old_lines, new_lines)
+  _dbg("INTERCEPT: path=" .. tostring(file_path) .. " old=" .. #old_lines .. " new=" .. #new_lines
+    .. " active_session=" .. tostring(M.active_session ~= nil))
   if not file_path then return end
   if #old_lines == 0 and #new_lines == 0 then return end
 
-  -- Compute hunks using vim.diff
+  -- If there's an active session, force-finish it
+  if M.active_session then
+    if not api.nvim_buf_is_valid(M.active_session.bufnr) then
+      M.active_session = nil
+    else
+      M._force_finish_session()
+    end
+  end
+
+  -- Compute hunks
   local diff_ok, hunks = pcall(M._compute_hunks, old_lines, new_lines)
   if not diff_ok then
-    M._echo("Diff error, reloading file: " .. tostring(hunks), "ErrorMsg")
-    M._reload_from_disk(file_path)
+    M._echo("Diff error: " .. tostring(hunks), "ErrorMsg")
     return
   end
 
-  -- Filter to hunks that have new lines (additions or replacements)
   local type_hunks = {}
   for _, hunk in ipairs(hunks) do
     if #hunk.new_lines > 0 then
       table.insert(type_hunks, hunk)
     end
   end
+  if #type_hunks == 0 then return end
 
-  if #type_hunks == 0 then
-    M._reload_from_disk(file_path)
-    return
+  local function find_normal_window()
+    for _, win in ipairs(api.nvim_list_wins()) do
+      if api.nvim_win_is_valid(win) then
+        local buf = api.nvim_win_get_buf(win)
+        local bt = vim.bo[buf].buftype
+        local cfg = api.nvim_win_get_config(win)
+        local is_float = cfg.relative and cfg.relative ~= ""
+        if not is_float and bt ~= "terminal" and bt ~= "nofile" then
+          return win
+        end
+      end
+    end
+    return nil
   end
 
   -- Find or open the buffer
   local target_bufnr = vim.fn.bufnr(file_path)
-  if target_bufnr == -1 then
+  if target_bufnr == -1 or not api.nvim_buf_is_valid(target_bufnr) then
+    local normal_win = find_normal_window()
+    if normal_win then api.nvim_set_current_win(normal_win) end
     vim.cmd("edit " .. vim.fn.fnameescape(file_path))
     target_bufnr = api.nvim_get_current_buf()
   end
 
   if not api.nvim_buf_is_loaded(target_bufnr) then
     vim.fn.bufload(target_bufnr)
+  end
+
+  -- Reload from disk to get the NEW content Claude wrote
+  pcall(api.nvim_buf_call, target_bufnr, function()
+    vim.cmd("silent! edit!")
+  end)
+
+  -- Verify buffer line count matches expected new content
+  local buf_line_count = api.nvim_buf_line_count(target_bufnr)
+  _dbg("BUFFER_LINES: " .. buf_line_count .. " expected=" .. #new_lines)
+
+  -- If buffer doesn't match new_lines, set it directly
+  if buf_line_count ~= #new_lines then
+    _dbg("BUFFER_MISMATCH: setting buffer to new_lines directly (" .. buf_line_count .. " -> " .. #new_lines .. ")")
+    api.nvim_set_option_value("modifiable", true, { buf = target_bufnr })
+    api.nvim_buf_set_lines(target_bufnr, 0, -1, false, new_lines)
   end
 
   -- Focus the buffer's window
@@ -505,77 +602,82 @@ function M._intercept_change(file_path, old_lines, new_lines)
   if win_id then
     api.nvim_set_current_win(win_id)
   else
+    local normal_win = find_normal_window()
+    if normal_win then api.nvim_set_current_win(normal_win) end
     vim.cmd("edit " .. vim.fn.fnameescape(file_path))
     target_bufnr = api.nvim_get_current_buf()
   end
 
-  -- Set buffer to old content
-  local set_ok = pcall(function()
-    api.nvim_set_option_value("modifiable", true, { buf = target_bufnr })
-    api.nvim_buf_set_lines(target_bufnr, 0, -1, false, old_lines)
-  end)
+  api.nvim_set_option_value("modifiable", true, { buf = target_bufnr })
 
-  if not set_ok then
-    M._echo("Failed to revert buffer, reloading from disk", "ErrorMsg")
-    M._reload_from_disk(file_path)
-    return
+  -- Build type_ranges: split hunks into sub-ranges of contiguous non-empty lines
+  local type_ranges = {}
+  for _, hunk in ipairs(type_hunks) do
+    local i = 1
+    while i <= #hunk.new_lines do
+      if hunk.new_lines[i] == "" then
+        i = i + 1
+      else
+        local range_start = i
+        local range_lines = {}
+        while i <= #hunk.new_lines and hunk.new_lines[i] ~= "" do
+          table.insert(range_lines, hunk.new_lines[i])
+          i = i + 1
+        end
+        table.insert(type_ranges, {
+          new_start = hunk.new_start + range_start - 1,
+          new_lines = range_lines,
+        })
+      end
+    end
   end
 
-  -- Process hunks sequentially, applying offset as we go
-  -- Each hunk changes the buffer length, so later hunks need adjustment
-  local offset = 0
+  if #type_ranges == 0 then return end
 
-  local function process_hunk(idx)
-    if idx > #type_hunks then
-      -- All done — save to disk
-      pcall(function()
-        api.nvim_buf_call(target_bufnr, function()
-          vim.cmd("silent! write!")
-        end)
+  -- Blank out only the non-empty lines in the buffer
+  for _, range in ipairs(type_ranges) do
+    local blanks = {}
+    for _ = 1, #range.new_lines do
+      table.insert(blanks, "")
+    end
+    pcall(api.nvim_buf_set_lines, target_bufnr,
+      range.new_start, range.new_start + #range.new_lines, false, blanks)
+  end
+
+  -- Process ranges sequentially
+  local function process_range(idx)
+    if idx > #type_ranges then
+      -- All done — restore full content, write to disk, clear modified
+      _dbg("ALL_RANGES_DONE: restoring full content and writing")
+      api.nvim_buf_set_lines(target_bufnr, 0, -1, false, new_lines)
+      pcall(api.nvim_buf_call, target_bufnr, function()
+        vim.cmd("silent! noautocmd write!")
+        vim.cmd("filetype detect")
       end)
       M._echo("All changes typed!", "MoreMsg")
       return
     end
 
-    local hunk = type_hunks[idx]
-    local adjusted_start = hunk.old_start + offset
-
-    -- Remove old lines for this hunk (replacement)
-    local remove_ok = true
-    if hunk.old_count > 0 then
-      remove_ok = pcall(api.nvim_buf_set_lines, target_bufnr,
-        adjusted_start, adjusted_start + hunk.old_count, false, {})
-    end
-
-    if not remove_ok then
-      M._echo("Error applying hunk, reloading from disk", "ErrorMsg")
-      M._reload_from_disk(file_path)
-      return
-    end
-
-    -- Track how many lines we're adding vs removing for offset
-    local lines_added = #hunk.new_lines
-    local lines_removed = hunk.old_count
-
-    M.start_session(target_bufnr, adjusted_start, hunk.new_lines, {
+    local range = type_ranges[idx]
+    M.start_session(target_bufnr, range.new_start, range.new_lines, {
+      lines_already_blank = true,
       on_complete = function()
-        offset = offset + lines_added - lines_removed
         vim.defer_fn(function()
-          process_hunk(idx + 1)
+          process_range(idx + 1)
         end, 300)
       end,
     })
   end
 
   M._echo(
-    string.format("Type %d change(s) for %s", #type_hunks, vim.fn.fnamemodify(file_path, ":t")),
+    string.format("Type %d change(s) for %s", #type_ranges, vim.fn.fnamemodify(file_path, ":t")),
     "MoreMsg"
   )
-  process_hunk(1)
+  process_range(1)
 end
 
 -- ============================================================================
--- Fallback: file watching (for when claudecode.nvim is not available)
+-- Fallback: file watching
 -- ============================================================================
 
 function M._start_file_watching()
@@ -650,18 +752,16 @@ end
 function M.setup(opts)
   M.config = vim.tbl_deep_extend("force", defaults, opts or {})
   M._register_commands()
-
-  -- Try to hook immediately
+  M._start_file_watching()
   M._hook_claudecode()
 
-  -- Retry strategies for lazy-loaded claudecode.nvim
   if not M._hooked then
-    vim.defer_fn(function()
-      M._hook_claudecode()
-    end, 1000)
-  end
+    for _, delay in ipairs({ 500, 1000, 2000, 5000 }) do
+      vim.defer_fn(function()
+        if not M._hooked then M._hook_claudecode() end
+      end, delay)
+    end
 
-  if not M._hooked then
     local retry_group = api.nvim_create_augroup("TypeToLearnRetry", { clear = true })
     api.nvim_create_autocmd("User", {
       group = retry_group,
