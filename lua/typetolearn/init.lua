@@ -7,6 +7,7 @@ local api = vim.api
 local ns = api.nvim_create_namespace("typetolearn")
 
 M.active_session = nil
+M._intercept_state = nil -- { bufnr, old_lines, new_lines } for full-buffer restore on cancel/skip
 M.config = {}
 M._hooked = false
 
@@ -201,7 +202,15 @@ function M._attach_keys(session)
   end, { buffer = session.bufnr, noremap = true })
 
   vim.keymap.set("i", "<Esc>", function()
+    if M.active_session then M.cancel_session() end
+  end, { buffer = session.bufnr, noremap = true })
+
+  vim.keymap.set("i", "<C-y>", function()
     if M.active_session then M.skip_session() end
+  end, { buffer = session.bufnr, noremap = true })
+
+  vim.keymap.set("i", "<C-l>", function()
+    if M.active_session then M._accept_line() end
   end, { buffer = session.bufnr, noremap = true })
 end
 
@@ -257,6 +266,32 @@ function M._on_enter()
   end
 end
 
+function M._accept_line()
+  local s = M.active_session
+  if not s then return end
+  local expected_line = s.lines[s.current_line + 1]
+  if not expected_line then return end
+
+  local remainder = expected_line:sub(s.current_col + 1)
+  local buf_line = s.start_line + s.current_line
+  local current_text = api.nvim_buf_get_lines(s.bufnr, buf_line, buf_line + 1, false)[1] or ""
+  api.nvim_buf_set_lines(s.bufnr, buf_line, buf_line + 1, false, { current_text .. remainder })
+  s.current_col = #expected_line
+  s.typed_chars = s.typed_chars + #remainder
+
+  if s.current_line >= #s.lines - 1 then
+    M._complete_session()
+    return
+  end
+
+  s.current_line = s.current_line + 1
+  s.current_col = 0
+  s.typed_chars = s.typed_chars + 1
+  local next_buf_line = s.start_line + s.current_line
+  api.nvim_win_set_cursor(0, { next_buf_line + 1, 0 })
+  M._render_ghost(s)
+end
+
 function M._on_backspace()
   local s = M.active_session
   if not s then return end
@@ -290,27 +325,39 @@ end
 function M.skip_session()
   local s = M.active_session
   if not s then return end
-  -- Fill in remaining content
-  for i = s.current_line, #s.lines - 1 do
-    local buf_line = s.start_line + i
-    api.nvim_buf_set_lines(s.bufnr, buf_line, buf_line + 1, false, { s.lines[i + 1] })
-  end
   M._cleanup(s)
+  -- Restore full buffer content (all ranges, not just current)
+  local state = M._intercept_state
+  if state and api.nvim_buf_is_valid(state.bufnr) then
+    api.nvim_buf_set_lines(state.bufnr, 0, -1, false, state.new_lines)
+    pcall(api.nvim_buf_call, state.bufnr, function()
+      vim.cmd("silent! noautocmd write!")
+      vim.cmd("filetype detect")
+    end)
+  end
+  M._intercept_state = nil
   M._echo("Skipped — changes applied.", "WarningMsg")
-  s.on_complete()
   M.active_session = nil
 end
 
 function M.cancel_session()
   local s = M.active_session
   if not s then return end
-  -- Fill in content (don't revert — disk already has new content)
-  for i = s.current_line, #s.lines - 1 do
-    local buf_line = s.start_line + i
-    api.nvim_buf_set_lines(s.bufnr, buf_line, buf_line + 1, false, { s.lines[i + 1] })
+  -- Revert to original content (undo the changes)
+  local state = M._intercept_state
+  if state and api.nvim_buf_is_valid(state.bufnr) then
+    api.nvim_buf_set_lines(state.bufnr, 0, -1, false, state.old_lines)
   end
+  -- Clean up extmarks, keymaps, insert mode AFTER restoring content
   M._cleanup(s)
-  M._echo("Cancelled — changes applied.", "WarningMsg")
+  if state and api.nvim_buf_is_valid(state.bufnr) then
+    pcall(api.nvim_buf_call, state.bufnr, function()
+      vim.cmd("silent! noautocmd write!")
+      vim.cmd("filetype detect")
+    end)
+  end
+  M._intercept_state = nil
+  M._echo("Cancelled — changes reverted.", "WarningMsg")
   M.active_session = nil
 end
 
@@ -319,18 +366,18 @@ end
 function M._force_finish_session()
   local s = M.active_session
   if not s then return end
-  _dbg("FORCE_FINISH: filling in remaining text")
-  -- Fill in all remaining lines
-  for i = s.current_line, #s.lines - 1 do
-    local buf_line = s.start_line + i
-    pcall(api.nvim_buf_set_lines, s.bufnr, buf_line, buf_line + 1, false, { s.lines[i + 1] })
-  end
+  _dbg("FORCE_FINISH: restoring full buffer content")
   M._cleanup(s)
-  -- Write to disk (noautocmd to avoid save hooks trimming lines)
-  pcall(api.nvim_buf_call, s.bufnr, function()
-    vim.cmd("silent! noautocmd write!")
-    vim.cmd("filetype detect")
-  end)
+  -- Restore full buffer content (all ranges)
+  local state = M._intercept_state
+  if state and api.nvim_buf_is_valid(state.bufnr) then
+    api.nvim_buf_set_lines(state.bufnr, 0, -1, false, state.new_lines)
+    pcall(api.nvim_buf_call, state.bufnr, function()
+      vim.cmd("silent! noautocmd write!")
+      vim.cmd("filetype detect")
+    end)
+  end
+  M._intercept_state = nil
   M.active_session = nil
 end
 
@@ -341,6 +388,8 @@ function M._cleanup(session)
   pcall(vim.keymap.del, "i", "<BS>", { buffer = session.bufnr })
   pcall(vim.keymap.del, "i", "<Tab>", { buffer = session.bufnr })
   pcall(vim.keymap.del, "i", "<Esc>", { buffer = session.bufnr })
+  pcall(vim.keymap.del, "i", "<C-y>", { buffer = session.bufnr })
+  pcall(vim.keymap.del, "i", "<C-l>", { buffer = session.bufnr })
   vim.cmd("stopinsert")
 end
 
@@ -634,6 +683,9 @@ function M._intercept_change(file_path, old_lines, new_lines)
 
   if #type_ranges == 0 then return end
 
+  -- Store state so cancel/skip can restore the full buffer
+  M._intercept_state = { bufnr = target_bufnr, old_lines = old_lines, new_lines = new_lines }
+
   -- Blank out only the non-empty lines in the buffer
   for _, range in ipairs(type_ranges) do
     local blanks = {}
@@ -654,6 +706,7 @@ function M._intercept_change(file_path, old_lines, new_lines)
         vim.cmd("silent! noautocmd write!")
         vim.cmd("filetype detect")
       end)
+      M._intercept_state = nil
       M._echo("All changes typed!", "MoreMsg")
       return
     end
