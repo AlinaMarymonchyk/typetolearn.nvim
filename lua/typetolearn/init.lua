@@ -18,100 +18,42 @@ local defaults = {
 }
 
 -- ============================================================================
--- Diff: find added lines between old and new
+-- Diff: use vim.diff for reliable hunk computation
 -- ============================================================================
 
-function M._compute_diff(old_lines, new_lines)
-  -- Use vim.diff for reliable unified diff output, then parse hunks
-  local ok, raw = pcall(vim.diff, table.concat(old_lines, "\n") .. "\n", table.concat(new_lines, "\n") .. "\n", {
-    result_type = "unified",
-    algorithm = "patience",
-  })
+--- Compute hunks using neovim's built-in vim.diff (Myers algorithm).
+--- Returns list of {start_line (0-indexed in old), count_old, count_new, new_lines}.
+function M._compute_hunks(old_lines, new_lines)
+  local old_text = table.concat(old_lines, "\n") .. "\n"
+  local new_text = table.concat(new_lines, "\n") .. "\n"
 
-  if not ok or not raw or raw == "" then
-    -- Fallback: if old is empty, everything is new
-    if #old_lines == 0 and #new_lines > 0 then
-      return { { old_start = 0, start_line = 0, old_lines = {}, new_lines = new_lines } }
-    end
-    return {}
-  end
+  -- vim.diff with result_type="indices" returns list of {start_a, count_a, start_b, count_b}
+  local indices = vim.diff(old_text, new_text, { result_type = "indices" })
 
   local hunks = {}
-  -- Parse unified diff hunk headers: @@ -old_start,old_count +new_start,new_count @@
-  local lines = vim.split(raw, "\n")
-  local li = 1
-  while li <= #lines do
-    local os, oc, ns, nc = lines[li]:match("^@@ %-(%d+),?(%d*) %+(%d+),?(%d*) @@")
-    if os then
-      os = tonumber(os)
-      oc = tonumber(oc) or 1
-      ns = tonumber(ns)
-      nc = tonumber(nc) or 1
-
-      local removed = {}
-      local added = {}
-      li = li + 1
-      while li <= #lines and not lines[li]:match("^@@") do
-        local prefix = lines[li]:sub(1, 1)
-        local content = lines[li]:sub(2)
-        if prefix == "-" then
-          table.insert(removed, content)
-        elseif prefix == "+" then
-          table.insert(added, content)
-        end
-        li = li + 1
-      end
-
-      if #added > 0 then
-        table.insert(hunks, {
-          old_start = os - 1, -- 0-indexed position in old file (for buffer operations)
-          start_line = ns - 1, -- 0-indexed position in new file
-          old_lines = removed,
-          new_lines = added,
-        })
-      end
-    else
-      li = li + 1
+  for _, idx in ipairs(indices) do
+    local start_a, count_a, start_b, count_b = idx[1], idx[2], idx[3], idx[4]
+    -- Extract the new lines for this hunk
+    local hunk_new_lines = {}
+    for i = start_b, start_b + count_b - 1 do
+      table.insert(hunk_new_lines, new_lines[i])
     end
+    table.insert(hunks, {
+      old_start = start_a - 1, -- convert to 0-indexed
+      old_count = count_a,
+      new_lines = hunk_new_lines,
+    })
   end
 
   return hunks
 end
 
 -- ============================================================================
--- Read file content reliably (buffer first, then disk)
--- ============================================================================
-
-function M._read_file(file_path)
-  if not file_path or file_path == "" then
-    return {}
-  end
-  -- Try buffer first
-  local bufnr = vim.fn.bufnr(file_path)
-  if bufnr ~= -1 and api.nvim_buf_is_loaded(bufnr) then
-    return api.nvim_buf_get_lines(bufnr, 0, -1, false)
-  end
-  -- Fallback to disk
-  local f = io.open(file_path, "r")
-  if f then
-    local content = f:read("*a")
-    f:close()
-    local lines = vim.split(content, "\n")
-    if #lines > 0 and lines[#lines] == "" then
-      table.remove(lines)
-    end
-    return lines
-  end
-  return {}
-end
-
--- ============================================================================
 -- Ghost text rendering
 -- ============================================================================
 
-function M._render_ghost_text(session)
+function M._render_ghost(session)
   api.nvim_buf_clear_namespace(session.bufnr, ns, 0, -1)
-  session.extmark_ids = {}
 
   for i, line in ipairs(session.lines) do
     local line_idx = session.start_line + i - 1
