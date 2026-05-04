@@ -738,14 +738,21 @@ function M._start_file_watching()
 
   local group = api.nvim_create_augroup("TypeToLearnWatch", { clear = true })
 
-  api.nvim_create_autocmd({ "BufReadPost", "BufWritePost" }, {
+  -- Snapshot on every event that establishes/refreshes a buffer's "current state":
+  --   BufReadPost  — existing file opened from disk
+  --   BufNewFile   — brand-new file (no disk content yet); snapshot is [""]
+  --   BufWritePost — buffer just written; refresh snapshot to match disk
+  --   BufFilePost  — buffer's filename changed (e.g. :saveas); snapshot under new name
+  -- Without BufNewFile, files created in this session would never get a snapshot
+  -- until first save, and FileChangedShellPost would silently no-op for them.
+  api.nvim_create_autocmd({ "BufReadPost", "BufNewFile", "BufWritePost", "BufFilePost" }, {
     group = group,
     callback = function(ev)
-      if not M.active_session then
-        local name = api.nvim_buf_get_name(ev.buf)
-        if name ~= "" then
-          M._file_snapshots[name] = api.nvim_buf_get_lines(ev.buf, 0, -1, false)
-        end
+      if M.active_session then return end
+      if vim.bo[ev.buf].buftype ~= "" then return end -- skip terminal/quickfix/etc.
+      local name = api.nvim_buf_get_name(ev.buf)
+      if name ~= "" then
+        M._file_snapshots[name] = api.nvim_buf_get_lines(ev.buf, 0, -1, false)
       end
     end,
   })
