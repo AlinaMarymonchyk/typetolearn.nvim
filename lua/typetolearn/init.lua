@@ -126,24 +126,25 @@ function M.start_session(bufnr, start_line, lines, opts)
 
   api.nvim_set_option_value("modifiable", true, { buf = bufnr })
 
+  -- Insert blank lines where the new content should go
   local blank_lines = {}
   for _ = 1, #lines do
     table.insert(blank_lines, "")
   end
   api.nvim_buf_set_lines(bufnr, start_line, start_line, false, blank_lines)
 
-  M._render_ghost_text(session)
+  M._render_ghost(session)
   api.nvim_win_set_cursor(0, { start_line + 1, 0 })
   vim.cmd("startinsert")
-  M._attach_key_handler(session)
-  M._echo("Type the ghost text to accept. [Esc to skip]", "MoreMsg")
+  M._attach_keys(session)
+  M._echo("Type the ghost text. [Esc] to skip remaining.", "MoreMsg")
 end
 
 -- ============================================================================
--- Keystroke handling
+-- Key handling
 -- ============================================================================
 
-function M._attach_key_handler(session)
+function M._attach_keys(session)
   local group = api.nvim_create_augroup("TypeToLearn", { clear = true })
 
   api.nvim_create_autocmd("InsertCharPre", {
@@ -154,47 +155,36 @@ function M._attach_key_handler(session)
       local char = vim.v.char
       vim.v.char = ""
       vim.schedule(function()
-        M._handle_char(char)
+        M._on_char(char)
       end)
     end,
   })
 
-  M._map_special_keys(session)
-
-  vim.keymap.set("i", "<Esc>", function()
-    if M.active_session then
-      M.skip_session()
-    end
-  end, { buffer = session.bufnr, noremap = true })
-end
-
-function M._map_special_keys(session)
   vim.keymap.set("i", "<CR>", function()
-    if not M.active_session then return end
-    M._handle_enter()
+    if M.active_session then M._on_enter() end
   end, { buffer = session.bufnr, noremap = true })
 
   vim.keymap.set("i", "<BS>", function()
-    if not M.active_session then return end
-    M._handle_backspace()
+    if M.active_session then M._on_backspace() end
   end, { buffer = session.bufnr, noremap = true })
 
   vim.keymap.set("i", "<Tab>", function()
     if not M.active_session then return end
-    local expandtab = vim.bo[session.bufnr].expandtab
-    if expandtab then
-      local sw = vim.bo[session.bufnr].shiftwidth
-      if sw == 0 then sw = 4 end
-      for _ = 1, sw do
-        M._handle_char(" ")
-      end
+    local sw = vim.bo[session.bufnr].shiftwidth
+    if sw == 0 then sw = 4 end
+    if vim.bo[session.bufnr].expandtab then
+      for _ = 1, sw do M._on_char(" ") end
     else
-      M._handle_char("\t")
+      M._on_char("\t")
     end
+  end, { buffer = session.bufnr, noremap = true })
+
+  vim.keymap.set("i", "<Esc>", function()
+    if M.active_session then M.skip_session() end
   end, { buffer = session.bufnr, noremap = true })
 end
 
-function M._handle_char(char)
+function M._on_char(char)
   local s = M.active_session
   if not s then return end
 
@@ -207,26 +197,23 @@ function M._handle_char(char)
     local buf_line = s.start_line + s.current_line
     local current_text = api.nvim_buf_get_lines(s.bufnr, buf_line, buf_line + 1, false)[1] or ""
     api.nvim_buf_set_lines(s.bufnr, buf_line, buf_line + 1, false, { current_text .. char })
-
     s.current_col = s.current_col + 1
     s.typed_chars = s.typed_chars + 1
 
-    if s.current_col >= #expected_line then
-      if s.current_line >= #s.lines - 1 then
-        M._complete_session()
-        return
-      end
+    if s.current_col >= #expected_line and s.current_line >= #s.lines - 1 then
+      M._complete_session()
+      return
     end
 
     api.nvim_win_set_cursor(0, { buf_line + 1, s.current_col })
-    M._render_ghost_text(s)
+    M._render_ghost(s)
   else
     s.errors = s.errors + 1
     M._flash_error(s)
   end
 end
 
-function M._handle_enter()
+function M._on_enter()
   local s = M.active_session
   if not s then return end
   local expected_line = s.lines[s.current_line + 1]
@@ -243,16 +230,15 @@ function M._handle_enter()
 
     local buf_line = s.start_line + s.current_line
     api.nvim_win_set_cursor(0, { buf_line + 1, 0 })
-    M._render_ghost_text(s)
+    M._render_ghost(s)
   else
     M._flash_error(s)
   end
 end
 
-function M._handle_backspace()
+function M._on_backspace()
   local s = M.active_session
   if not s then return end
-
   if s.current_col > 0 then
     s.current_col = s.current_col - 1
     local buf_line = s.start_line + s.current_line
@@ -261,7 +247,7 @@ function M._handle_backspace()
       api.nvim_buf_set_lines(s.bufnr, buf_line, buf_line + 1, false, { current_text:sub(1, -2) })
     end
     api.nvim_win_set_cursor(0, { buf_line + 1, math.max(0, s.current_col) })
-    M._render_ghost_text(s)
+    M._render_ghost(s)
   end
 end
 
