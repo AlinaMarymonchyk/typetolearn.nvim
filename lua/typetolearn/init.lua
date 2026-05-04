@@ -333,32 +333,46 @@ function M._hook_claudecode()
   if M._hooked then return end
 
   local ok, claude_diff = pcall(require, "claudecode.diff")
-  if not ok then return end
+  if not ok then
+    M._echo("claudecode.diff not found, using file watcher fallback", "WarningMsg")
+    M._start_file_watching()
+    return
+  end
+
   if not claude_diff._register_diff_state or not claude_diff.close_diff_by_tab_name then
+    M._echo("claudecode.diff API changed, using fallback", "WarningMsg")
+    M._start_file_watching()
     return
   end
 
   M._hooked = true
   M._echo("Hooked into claudecode.nvim!", "MoreMsg")
 
+  M._diff_data = {}
+
   -- Capture diff data when claudecode registers a diff
   local original_register = claude_diff._register_diff_state
   claude_diff._register_diff_state = function(tab_name, diff_data)
-    -- Read old file content NOW from disk (NOT buffer — buffer might be the diff view)
+    -- Read old file content from buffer (more reliable than io.open)
     local old_lines = {}
     if diff_data.old_file_path then
-      local f = io.open(diff_data.old_file_path, "r")
-      if f then
-        local content = f:read("*a")
-        f:close()
-        old_lines = vim.split(content, "\n")
-        if #old_lines > 0 and old_lines[#old_lines] == "" then
-          table.remove(old_lines)
+      local bufnr = vim.fn.bufnr(diff_data.old_file_path)
+      if bufnr ~= -1 and api.nvim_buf_is_loaded(bufnr) then
+        old_lines = api.nvim_buf_get_lines(bufnr, 0, -1, false)
+      else
+        local f = io.open(diff_data.old_file_path, "r")
+        if f then
+          local content = f:read("*a")
+          f:close()
+          old_lines = vim.split(content, "\n")
+          if #old_lines > 0 and old_lines[#old_lines] == "" then
+            table.remove(old_lines)
+          end
         end
       end
     end
 
-    -- Parse new content into lines
+    -- Parse new content
     local new_lines = {}
     if diff_data.new_file_contents then
       new_lines = vim.split(diff_data.new_file_contents, "\n")
@@ -372,12 +386,10 @@ function M._hook_claudecode()
       old_lines = old_lines,
       new_lines = new_lines,
     }
-    vim.notify(string.format("[type-to-learn] Captured diff: old=%d lines, new=%d lines, path=%s",
-      #old_lines, #new_lines, diff_data.old_file_path or "nil"), vim.log.levels.INFO)
     return original_register(tab_name, diff_data)
   end
 
-  -- Intercept when CLI accepts (close_tab → close_diff_by_tab_name)
+  -- Patch close_diff_by_tab_name — called when CLI accepts via "Yes"
   local original_close = claude_diff.close_diff_by_tab_name
   claude_diff.close_diff_by_tab_name = function(tab_name)
     local captured = M._diff_data[tab_name]
@@ -385,34 +397,50 @@ function M._hook_claudecode()
 
     local result = original_close(tab_name)
 
-    if captured and captured.old_file_path and not captured._handled then
+    if captured and captured.old_file_path and not captured._accepted_in_nvim then
       vim.defer_fn(function()
-        -- Check if file actually changed on disk (accept vs reject)
-        local disk_lines = M._read_file(captured.old_file_path)
+        -- Check if file on disk actually changed (accept vs reject)
+        local f = io.open(captured.old_file_path, "r")
+        if not f then
+          -- New file that was accepted
+          if #captured.new_lines > 0 then
+            M._intercept_change(captured.old_file_path, captured.old_lines, captured.new_lines)
+          end
+          return
+        end
+        local disk_content = f:read("*a")
+        f:close()
+        local disk_lines = vim.split(disk_content, "\n")
+        if #disk_lines > 0 and disk_lines[#disk_lines] == "" then
+          table.remove(disk_lines)
+        end
+
+        -- Compare disk to old content
         local changed = #disk_lines ~= #captured.old_lines
         if not changed then
-          for i = 1, #disk_lines do
-            if disk_lines[i] ~= captured.old_lines[i] then
+          for idx = 1, #disk_lines do
+            if disk_lines[idx] ~= captured.old_lines[idx] then
               changed = true
               break
             end
           end
         end
+
         if changed then
-          M._on_buffer_changed(captured.old_file_path, captured.old_lines, captured.new_lines)
+          M._intercept_change(captured.old_file_path, captured.old_lines, captured.new_lines)
         end
-      end, 500)
+      end, 300)
     end
 
     return result
   end
 
-  -- Intercept when user accepts via :w in nvim diff view
+  -- Patch _resolve_diff_as_saved — called when user accepts via :w in nvim
   local original_resolve = claude_diff._resolve_diff_as_saved
   claude_diff._resolve_diff_as_saved = function(tab_name, buffer_id)
     local captured = M._diff_data[tab_name]
     if captured then
-      captured._handled = true
+      captured._accepted_in_nvim = true
     end
 
     original_resolve(tab_name, buffer_id)
@@ -570,25 +598,22 @@ function M._start_file_watching()
   api.nvim_create_autocmd("FileChangedShellPost", {
     group = group,
     callback = function(ev)
-      if M.active_session then return end
-      local filepath = api.nvim_buf_get_name(ev.buf)
-      if filepath == "" then return end
-      local old_lines = M._file_snapshots[filepath]
-      if not old_lines then return end
-      local new_lines = api.nvim_buf_get_lines(ev.buf, 0, -1, false)
-      M._file_snapshots[filepath] = nil
       vim.defer_fn(function()
-        M._on_buffer_changed(filepath, old_lines, new_lines)
+        if M.active_session then return end
+        local filepath = api.nvim_buf_get_name(ev.buf)
+        local old_lines = M._file_snapshots[filepath]
+        if not old_lines then return end
+        local new_lines = api.nvim_buf_get_lines(ev.buf, 0, -1, false)
+        M._file_snapshots[filepath] = nil
+        M._intercept_change(filepath, old_lines, new_lines)
       end, 100)
     end,
   })
 
-  api.nvim_create_autocmd({ "FocusGained", "CursorHold" }, {
+  api.nvim_create_autocmd("FocusGained", {
     group = group,
     callback = function()
-      if not M.active_session then
-        vim.cmd("silent! checktime")
-      end
+      if not M.active_session then vim.cmd("silent! checktime") end
     end,
   })
 end
@@ -598,6 +623,14 @@ end
 -- ============================================================================
 
 function M._register_commands()
+  api.nvim_create_user_command("TypeToLearnSkip", function()
+    M.skip_session()
+  end, { desc = "Skip current typing session" })
+
+  api.nvim_create_user_command("TypeToLearnCancel", function()
+    M.cancel_session()
+  end, { desc = "Cancel current typing session" })
+
   api.nvim_create_user_command("TypeToLearnDemo", function()
     local bufnr = api.nvim_get_current_buf()
     local cursor = api.nvim_win_get_cursor(0)
@@ -618,14 +651,14 @@ function M.setup(opts)
   M.config = vim.tbl_deep_extend("force", defaults, opts or {})
   M._register_commands()
 
-  -- Always start file watcher
-  M._start_file_watching()
-
-  -- Hook claudecode.nvim
+  -- Try to hook immediately
   M._hook_claudecode()
 
+  -- Retry strategies for lazy-loaded claudecode.nvim
   if not M._hooked then
-    vim.defer_fn(function() M._hook_claudecode() end, 1000)
+    vim.defer_fn(function()
+      M._hook_claudecode()
+    end, 1000)
   end
 
   if not M._hooked then
