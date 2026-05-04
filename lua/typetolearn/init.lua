@@ -65,28 +65,26 @@ function M._render_ghost(session)
     elseif is_current then
       local remaining = line:sub(session.current_col + 1)
       if #remaining > 0 then
-        local id = api.nvim_buf_set_extmark(session.bufnr, ns, line_idx, session.current_col, {
+        api.nvim_buf_set_extmark(session.bufnr, ns, line_idx, session.current_col, {
           virt_text = { { remaining, M.config.ghost_hl } },
           virt_text_pos = "overlay",
           hl_mode = "combine",
         })
-        table.insert(session.extmark_ids, id)
       end
     else
       if #line > 0 then
-        local id = api.nvim_buf_set_extmark(session.bufnr, ns, line_idx, 0, {
+        api.nvim_buf_set_extmark(session.bufnr, ns, line_idx, 0, {
           virt_text = { { line, M.config.ghost_hl } },
           virt_text_pos = "overlay",
           hl_mode = "combine",
         })
-        table.insert(session.extmark_ids, id)
       end
     end
   end
 end
 
 -- ============================================================================
--- Core: Start a typing session
+-- Typing session
 -- ============================================================================
 
 function M.start_session(bufnr, start_line, lines, opts)
@@ -96,6 +94,7 @@ function M.start_session(bufnr, start_line, lines, opts)
     M.cancel_session()
   end
 
+  -- Trim trailing empty lines
   while #lines > 0 and lines[#lines] == "" do
     table.remove(lines)
   end
@@ -111,7 +110,6 @@ function M.start_session(bufnr, start_line, lines, opts)
     start_line = start_line,
     current_line = 0,
     current_col = 0,
-    extmark_ids = {},
     on_complete = opts.on_complete or function() end,
     total_chars = 0,
     typed_chars = 0,
